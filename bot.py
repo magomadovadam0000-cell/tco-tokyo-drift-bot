@@ -18,14 +18,27 @@ TICKET_CHANNEL_ID = 1543274172321370303
 TICKET_CATEGORY_ID = 1543383561103474839
 LOGS_CATEGORY_ID = 1543383625456812102
 
-# Dictionnaire pour le cooldown des tickets (60 sec)
+# Salons pour les annonces de rôles et les logs système
+ANNOUNCEMENT_CHANNEL_ID = 1543273800000000000  # ⚠️ Remplace par l'ID de ton salon Annonces
+COMMAND_LOGS_CHANNEL_ID = 1543273900000000000  # ⚠️ Remplace par l'ID de ton salon Logs
+
+# 🏆 LES 5 RÔLES DRIFT & PALIERS DE VICTOIRES (PALIERS PERSONNALISABLES)
+RANK_THRESHOLDS = [
+    (50, "King"),
+    (30, "Tracker"),
+    (15, "Pro"),
+    (5, "Street"),
+    (0, "Rookie")
+]
+
+ALL_DRIVER_ROLES = ["King", "Tracker", "Pro", "Street", "Rookie"]
+
 user_cooldowns = {}
 
-# --- BASE DE DONNÉES SQLITE (Leaderboard) ---
+# --- BASE DE DONNÉES SQLITE ---
 def init_db():
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    # Table des scores (victoires / points)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS leaderboard (
             user_id INTEGER PRIMARY KEY,
@@ -33,7 +46,6 @@ def init_db():
             score INTEGER DEFAULT 0
         )
     """)
-    # Table de configuration (ID du message du leaderboard)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
@@ -47,7 +59,80 @@ init_db()
 
 
 # ==========================================
-# 1. SYSTÈME DE TICKETS (Help & Report)
+# ⚙️ GESTION AUTOMATIQUE DES RÔLES ET RANGS
+# ==========================================
+
+async def check_and_update_driver_role(guild: discord.Guild, member: discord.Member, new_score: int):
+    """Détermine le rôle correspondant au score et l'attribue au membre sur Discord."""
+    target_role_name = "Rookie"
+    for threshold, role_name in RANK_THRESHOLDS:
+        if new_score >= threshold:
+            target_role_name = role_name
+            break
+
+    target_role = discord.utils.get(guild.roles, name=target_role_name)
+    if not target_role:
+        print(f"⚠️ Le rôle '{target_role_name}' n'a pas été trouvé sur le serveur.")
+        return
+
+    # Vérifie si le membre a déjà exactement ce rôle
+    if target_role in member.roles:
+        return
+
+    # Supprime tous les anciens rôles de pilote
+    roles_to_remove = [r for r in member.roles if r.name in ALL_DRIVER_ROLES and r.name != target_role_name]
+    if roles_to_remove:
+        try:
+            await member.remove_roles(*roles_to_remove)
+        except Exception as e:
+            print(f"Erreur lors du retrait des anciens rôles : {e}")
+
+    # Ajoute le nouveau rôle
+    try:
+        await member.add_roles(target_role)
+        
+        # Envoi de l'annonce dans le salon Annonces
+        announcement_channel = guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+        if announcement_channel:
+            embed = discord.Embed(
+                title="🏎️ NEW DRIVER RANK ACHIEVED!",
+                description=f"Congratulations {member.mention}! You have officially reached **{new_score} Wins** and unlocked the **{target_role.name}** rank! 🎉",
+                color=discord.Color.gold(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.set_footer(text="TCO Drift Driver Progression")
+            await announcement_channel.send(embed=embed)
+    except Exception as e:
+        print(f"Erreur lors de l'ajout du rôle {target_role_name} : {e}")
+
+
+# ==========================================
+# 1. LOGS AUTOMATIQUES DES COMMANDES EXÉCUTÉES
+# ==========================================
+
+@bot.event
+async def on_app_command_completion(interaction: discord.Interaction, command: discord.app_commands.Command):
+    """Enregistre un log complet à chaque fois qu'une commande Slash est exécutée avec succès."""
+    log_channel = interaction.guild.get_channel(COMMAND_LOGS_CHANNEL_ID)
+    if log_channel:
+        embed = discord.Embed(
+            title="📜 COMMAND LOG ENTRY",
+            description=f"**Executor:** {interaction.user.mention} (`{interaction.user.id}`)\n"
+                        f"**Command Used:** `/{command.name}`\n"
+                        f"**Channel:** {interaction.channel.mention}",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        if interaction.data.get("options"):
+            opts = [f"`{opt['name']}`: {opt['value']}" for opt in interaction.data["options"]]
+            embed.add_field(name="Arguments", value="\n".join(opts), inline=False)
+            
+        await log_channel.send(embed=embed)
+
+
+# ==========================================
+# 2. SYSTÈME DE TICKETS (Help & Report)
 # ==========================================
 
 class TicketControlView(discord.ui.View):
@@ -56,7 +141,6 @@ class TicketControlView(discord.ui.View):
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.secondary, custom_id="ticket_close_btn", emoji="🔒")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Restriction : Modérateurs ou Admins uniquement
         if not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
             await interaction.response.send_message("❌ Only moderators and server owners can close tickets.", ephemeral=True)
             return
@@ -65,24 +149,32 @@ class TicketControlView(discord.ui.View):
         if logs_category:
             await interaction.channel.edit(category=logs_category, sync_permissions=False)
             
-            # Retire l'accès aux membres normaux
             for target, overwrite in interaction.channel.overwrites.items():
                 if isinstance(target, discord.Member) and not target.guild_permissions.manage_channels:
                     await interaction.channel.set_permissions(target, overwrite=None)
 
             embed = discord.Embed(
-                title="🔒 Ticket Closed",
-                description=f"This ticket was closed by {interaction.user.mention} and archived in **Ticket Logs**.",
+                title="🔒 Ticket Closed & Archived",
+                description=f"This ticket was closed by {interaction.user.mention} and archived.",
                 color=discord.Color.gold(),
                 timestamp=datetime.datetime.now(datetime.timezone.utc)
             )
             await interaction.response.send_message(embed=embed)
+
+            log_channel = interaction.guild.get_channel(COMMAND_LOGS_CHANNEL_ID)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="📌 TICKET ARCHIVED LOG",
+                    description=f"**Ticket Channel:** {interaction.channel.name}\n**Closed By:** {interaction.user.mention}",
+                    color=discord.Color.dark_grey(),
+                    timestamp=datetime.datetime.now(datetime.timezone.utc)
+                )
+                await log_channel.send(embed=log_embed)
         else:
             await interaction.response.send_message("❌ Ticket Logs category not found.", ephemeral=True)
 
     @discord.ui.button(label="Delete Ticket", style=discord.ButtonStyle.danger, custom_id="ticket_delete_btn", emoji="🗑️")
     async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Restriction : Owner du serveur uniquement
         if interaction.user != interaction.guild.owner:
             await interaction.response.send_message("❌ Only the server Owner can delete tickets.", ephemeral=True)
             return
@@ -111,7 +203,6 @@ class TicketDropdown(discord.ui.Select):
         guild = interaction.guild
         now = datetime.datetime.now(datetime.timezone.utc)
 
-        # 1. Cooldown de 60 secondes
         if user.id in user_cooldowns:
             elapsed = (now - user_cooldowns[user.id]).total_seconds()
             if elapsed < 60:
@@ -119,7 +210,6 @@ class TicketDropdown(discord.ui.Select):
                 await interaction.response.send_message(f"⏳ Please wait {remaining} seconds before opening another ticket.", ephemeral=True)
                 return
 
-        # 2. Vérification si ticket déjà actif
         ticket_category = guild.get_channel(TICKET_CATEGORY_ID)
         if ticket_category:
             for channel in ticket_category.text_channels:
@@ -164,19 +254,15 @@ class TicketDropdownView(discord.ui.View):
 
 
 # ==========================================
-# 2. GESTION DU LEADERBOARD AUTOMATIQUE
+# 3. GESTION DU LEADERBOARD AUTOMATIQUE
 # ==========================================
 
 async def update_leaderboard_message(guild):
-    """Met à jour le message d'affichage du classement dans le salon dédié"""
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-
-    # Récupérer les 10 meilleurs scores
     cursor.execute("SELECT username, score FROM leaderboard ORDER BY score DESC LIMIT 10")
     top_scores = cursor.fetchall()
 
-    # Récupérer l'ID du message stocké en DB
     cursor.execute("SELECT value FROM config WHERE key = 'lb_message_id'")
     row = cursor.fetchone()
     message_id = row[0] if row else None
@@ -186,7 +272,6 @@ async def update_leaderboard_message(guild):
     if not channel:
         return
 
-    # Construction du tableau de score
     embed = discord.Embed(
         title="🏆 TCO DRIFT — OFFICIAL LEADERBOARD",
         description="Official driver standings updated by Server Owner.",
@@ -206,7 +291,6 @@ async def update_leaderboard_message(guild):
 
     embed.set_footer(text="Auto-updated by TCO Drift Bot")
 
-    # Mettre à jour le message s'il existe déjà
     if message_id:
         try:
             msg = await channel.fetch_message(message_id)
@@ -215,7 +299,6 @@ async def update_leaderboard_message(guild):
         except discord.NotFound:
             pass
 
-    # Si pas de message existant, en créer un nouveau
     new_msg = await channel.send(embed=embed)
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
@@ -225,7 +308,7 @@ async def update_leaderboard_message(guild):
 
 
 # ==========================================
-# 3. COMMANDES SLASH (ALL IN SLASH)
+# 4. COMMANDES SLASH (OWNER ONLY)
 # ==========================================
 
 @bot.event
@@ -240,7 +323,6 @@ async def on_ready():
     print(f"Connecté en tant que : {bot.user}")
 
 
-# --- 1. /setup_ticket (OWNER ONLY) ---
 @bot.tree.command(name="setup_ticket", description="Afficher le panneau de ticket (Owner uniquement).")
 async def setup_ticket(interaction: discord.Interaction):
     if interaction.user != interaction.guild.owner:
@@ -263,7 +345,6 @@ async def setup_ticket(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Ticket panel posted successfully!", ephemeral=True)
 
 
-# --- 2. /setup_leaderboard (OWNER ONLY) ---
 @bot.tree.command(name="setup_leaderboard", description="Initialiser le message du leaderboard (Owner uniquement).")
 async def setup_leaderboard(interaction: discord.Interaction):
     if interaction.user != interaction.guild.owner:
@@ -274,8 +355,7 @@ async def setup_leaderboard(interaction: discord.Interaction):
     await update_leaderboard_message(interaction.guild)
 
 
-# --- 3. /add_win (OWNER ONLY) ---
-@bot.tree.command(name="add_win", description="Ajouter des victoires/points à un joueur (Owner uniquement).")
+@bot.tree.command(name="add_win", description="Ajouter des victoires à un joueur et ajuster son rôle (Owner uniquement).")
 async def add_win(interaction: discord.Interaction, member: discord.Member, amount: int = 1):
     if interaction.user != interaction.guild.owner:
         await interaction.response.send_message("❌ Only the server Owner can manage wins.", ephemeral=True)
@@ -294,11 +374,13 @@ async def add_win(interaction: discord.Interaction, member: discord.Member, amou
     conn.close()
 
     await interaction.response.send_message(f"✅ Added `{amount}` win(s) to **{member.display_name}**. Total: `{new_score}`", ephemeral=True)
+    
+    # 🏎️ MISE A JOUR DU ROLE ET DU LEADERBOARD
+    await check_and_update_driver_role(interaction.guild, member, new_score)
     await update_leaderboard_message(interaction.guild)
 
 
-# --- 4. /remove_win (OWNER ONLY) ---
-@bot.tree.command(name="remove_win", description="Retirer des victoires/points à un joueur (Owner uniquement).")
+@bot.tree.command(name="remove_win", description="Retirer des victoires à un joueur et ajuster son rôle (Owner uniquement).")
 async def remove_win(interaction: discord.Interaction, member: discord.Member, amount: int = 1):
     if interaction.user != interaction.guild.owner:
         await interaction.response.send_message("❌ Only the server Owner can manage wins.", ephemeral=True)
@@ -309,7 +391,7 @@ async def remove_win(interaction: discord.Interaction, member: discord.Member, a
     cursor.execute("SELECT score FROM leaderboard WHERE user_id = ?", (member.id,))
     row = cursor.fetchone()
     current_score = row[0] if row else 0
-    new_score = max(0, current_score - amount)  # Empêche d'avoir un score négatif
+    new_score = max(0, current_score - amount)
 
     cursor.execute("INSERT OR REPLACE INTO leaderboard (user_id, username, score) VALUES (?, ?, ?)",
                    (member.id, member.display_name, new_score))
@@ -317,6 +399,9 @@ async def remove_win(interaction: discord.Interaction, member: discord.Member, a
     conn.close()
 
     await interaction.response.send_message(f"✅ Removed `{amount}` win(s) from **{member.display_name}**. Total: `{new_score}`", ephemeral=True)
+    
+    # 🏎️ MISE A JOUR DU ROLE ET DU LEADERBOARD
+    await check_and_update_driver_role(interaction.guild, member, new_score)
     await update_leaderboard_message(interaction.guild)
 
 
