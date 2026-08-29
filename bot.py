@@ -1,0 +1,283 @@
+import discord
+from discord.ext import commands
+import sqlite3
+import datetime
+
+# --- CONFIGURATION INITIALE & INTENTS ---
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- IDENTIFIANTS DU SERVEUR ---
+LEADERBOARD_CHANNEL_ID = 1543274008311763044
+TICKET_CHANNEL_ID = 1543274172321370303
+TICKET_CATEGORY_ID = 1543383561103474839
+LOGS_CATEGORY_ID = 1543383625456812102
+
+# Dictionnaire pour le cooldown des tickets (60 sec)
+user_cooldowns = {}
+
+# --- BASE DE DONNÉES SQLITE (Leaderboard) ---
+def init_db():
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    # Table des scores
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS leaderboard (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            score INTEGER
+        )
+    """)
+    # Table pour stocker l'ID du message du leaderboard
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+
+# ==========================================
+# 1. SYSTÈME DE TICKETS (Help & Report)
+# ==========================================
+
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.secondary, custom_id="ticket_close_btn", emoji="🔒")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Restriction : Modérateurs ou Admins uniquement
+        if not (interaction.user.guild_permissions.manage_channels or interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("❌ Only moderators and server owners can close tickets.", ephemeral=True)
+            return
+
+        logs_category = interaction.guild.get_channel(LOGS_CATEGORY_ID)
+        if logs_category:
+            await interaction.channel.edit(category=logs_category, sync_permissions=False)
+            
+            # Retire l'accès aux membres normaux
+            for target, overwrite in interaction.channel.overwrites.items():
+                if isinstance(target, discord.Member) and not target.guild_permissions.manage_channels:
+                    await interaction.channel.set_permissions(target, overwrite=None)
+
+            embed = discord.Embed(
+                title="🔒 Ticket Closed",
+                description=f"This ticket was closed by {interaction.user.mention} and archived in **Ticket Logs**.",
+                color=discord.Color.gold(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            await interaction.response.send_message(embed=embed)
+        else:
+            await interaction.response.send_message("❌ Ticket Logs category not found.", ephemeral=True)
+
+    @discord.ui.button(label="Delete Ticket", style=discord.ButtonStyle.danger, custom_id="ticket_delete_btn", emoji="🗑️")
+    async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Restriction : Owner du serveur uniquement
+        if not (interaction.user == interaction.guild.owner or interaction.user.guild_permissions.administrator):
+            await interaction.response.send_message("❌ Only the server Owner can delete tickets.", ephemeral=True)
+            return
+
+        await interaction.response.send_message("🗑️ Deleting ticket in 5 seconds...")
+        await discord.utils.sleep_until(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=5))
+        await interaction.channel.delete()
+
+
+class TicketDropdown(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Help", value="help", description="General support, technical assistance, or questions.", emoji="❓"),
+            discord.SelectOption(label="Report", value="report", description="Report a rule violation or player misconduct.", emoji="🛡️")
+        ]
+        super().__init__(
+            placeholder="Select a category to open a ticket...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="ticket_dropdown_select"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user = interaction.user
+        guild = interaction.guild
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        # 1. Cooldown de 60 secondes
+        if user.id in user_cooldowns:
+            elapsed = (now - user_cooldowns[user.id]).total_seconds()
+            if elapsed < 60:
+                remaining = int(60 - elapsed)
+                await interaction.response.send_message(f"⏳ Please wait {remaining} seconds before opening another ticket.", ephemeral=True)
+                return
+
+        # 2. Vérification si ticket déjà actif
+        ticket_category = guild.get_channel(TICKET_CATEGORY_ID)
+        if ticket_category:
+            for channel in ticket_category.text_channels:
+                if channel.name.endswith(f"-{user.id}") or channel.name.startswith(f"{self.values[0]}-{user.name.lower()}"):
+                    await interaction.response.send_message("❌ You already have an active ticket open!", ephemeral=True)
+                    return
+
+        user_cooldowns[user.id] = now
+        selected_option = self.values[0]
+        channel_name = f"{selected_option}-{user.name.lower()}"
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        }
+
+        ticket_channel = await guild.create_text_channel(
+            name=channel_name,
+            category=ticket_category,
+            overwrites=overwrites,
+            reason=f"Ticket opened by {user}"
+        )
+
+        await interaction.response.send_message(f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True)
+
+        embed = discord.Embed(
+            title=f"Ticket: {selected_option.upper()} — {user.display_name}",
+            description=f"Welcome {user.mention}!\n\nPlease explain your issue or report in detail. Staff will assist you shortly.",
+            color=discord.Color.red() if selected_option == "report" else discord.Color.blue(),
+            timestamp=now
+        )
+        embed.set_footer(text="TCO Drift Ticket System")
+
+        await ticket_channel.send(embed=embed, view=TicketControlView())
+
+
+class TicketDropdownView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(TicketDropdown())
+
+
+# ==========================================
+# 2. LEADERBOARD AUTOMATIQUE
+# ==========================================
+
+async def update_leaderboard_message(guild):
+    """Fonction qui met à jour le message d'affichage du classement"""
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+
+    # Récupérer les 10 meilleurs scores
+    cursor.execute("SELECT username, score FROM leaderboard ORDER BY score DESC LIMIT 10")
+    top_scores = cursor.fetchall()
+
+    # Récupérer l'ID du message stocké en DB
+    cursor.execute("SELECT value FROM config WHERE key = 'lb_message_id'")
+    row = cursor.fetchone()
+    message_id = row[0] if row else None
+    conn.close()
+
+    channel = guild.get_channel(LEADERBOARD_CHANNEL_ID)
+    if not channel:
+        return
+
+    # Construction du texte du classement
+    embed = discord.Embed(
+        title="🏆 TCO DRIFT — OFFICIAL LEADERBOARD",
+        description="Top drift scores verified by Staff & Owners.",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    if not top_scores:
+        embed.add_field(name="Standings", value="No scores registered yet.", inline=False)
+    else:
+        lb_text = ""
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, (username, score) in enumerate(top_scores, start=1):
+            prefix = medals[idx-1] if idx <= 3 else f"`#{idx}`"
+            lb_text += f"{prefix} **{username}** — `{score:,}` pts\n"
+        embed.add_field(name="Top Drivers", value=lb_text, inline=False)
+
+    embed.set_footer(text="Auto-updated by TCO Drift Bot")
+
+    # Mettre à jour le message ou en créer un nouveau s'il n'existe pas
+    if message_id:
+        try:
+            msg = await channel.fetch_message(message_id)
+            await msg.edit(embed=embed)
+            return
+        except discord.NotFound:
+            pass
+
+    # Si pas de message existant, en envoyer un nouveau et enregistrer son ID
+    new_msg = await channel.send(embed=embed)
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO config (key, value) VALUES ('lb_message_id', ?)", (new_msg.id,))
+    conn.commit()
+    conn.close()
+
+
+# ==========================================
+# 3. COMMANDES ET ÉVÉNEMENTS BOT
+# ==========================================
+
+@bot.event
+async def on_ready():
+    # Enregistrer les vues persistantes pour les boutons/dropdowns
+    bot.add_view(TicketDropdownView())
+    bot.add_view(TicketControlView())
+    try:
+        synced = await bot.tree.sync()
+        print(f"OK ! {len(synced)} commande(s) synchronisée(s) globalement.")
+    except Exception as e:
+        print(f"Erreur de synchro : {e}")
+    print(f"Connecté en tant que : {bot.user}")
+
+# Commandes slash ou préfixe pour configurer
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setup_ticket(ctx):
+    """Envoie le panneau de ticket dans le salon courant"""
+    embed = discord.Embed(
+        title="🏎️ TCO DRIFT — SUPPORT & TICKETS",
+        description=(
+            "Need help or want to report a rule violation?\n"
+            "Select an option from the drop-down menu below to open a private ticket with our staff.\n\n"
+            "📌 **Ticket Rules:**\n"
+            "• You can only have **1 active ticket** at a time.\n"
+            "• A **60-second cooldown** applies between creations.\n"
+            "• Only Moderators and Owners can close tickets; only Owners can delete them."
+        ),
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed, view=TicketDropdownView())
+    await ctx.message.delete()
+
+@bot.tree.command(name="add_score", description="Ajouter ou modifier le score d'un pilote (Staff uniquement).")
+async def add_score(interaction: discord.Interaction, member: discord.Member, score: int):
+    # Restriction Staff / Admin
+    if not (interaction.user.guild_permissions.manage_messages or interaction.user.guild_permissions.administrator):
+        await interaction.response.send_message("❌ Only moderators can manage scores.", ephemeral=True)
+        return
+
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO leaderboard (user_id, username, score) VALUES (?, ?, ?)", 
+                   (member.id, member.display_name, score))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"✅ Score updated: **{member.display_name}** — `{score:,}` pts", ephemeral=True)
+    # Mettre à jour le classement en direct
+    await update_leaderboard_message(interaction.guild)
+
+# LANCEMENT DU BOT
+import os
+from dotenv import load_dotenv
+load_dotenv()
+bot.run(os.getenv("DISCORD_TOKEN"))
