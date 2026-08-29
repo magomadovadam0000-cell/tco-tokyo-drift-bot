@@ -2,6 +2,8 @@ import discord
 from discord.ext import commands
 import sqlite3
 import datetime
+import os
+from dotenv import load_dotenv
 
 # --- CONFIGURATION INITIALE & INTENTS ---
 intents = discord.Intents.default()
@@ -23,15 +25,15 @@ user_cooldowns = {}
 def init_db():
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    # Table des scores
+    # Table des scores (victoires / points)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS leaderboard (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            score INTEGER
+            score INTEGER DEFAULT 0
         )
     """)
-    # Table pour stocker l'ID du message du leaderboard
+    # Table de configuration (ID du message du leaderboard)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
@@ -81,7 +83,7 @@ class TicketControlView(discord.ui.View):
     @discord.ui.button(label="Delete Ticket", style=discord.ButtonStyle.danger, custom_id="ticket_delete_btn", emoji="🗑️")
     async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Restriction : Owner du serveur uniquement
-        if not (interaction.user == interaction.guild.owner or interaction.user.guild_permissions.administrator):
+        if interaction.user != interaction.guild.owner:
             await interaction.response.send_message("❌ Only the server Owner can delete tickets.", ephemeral=True)
             return
 
@@ -162,11 +164,11 @@ class TicketDropdownView(discord.ui.View):
 
 
 # ==========================================
-# 2. LEADERBOARD AUTOMATIQUE
+# 2. GESTION DU LEADERBOARD AUTOMATIQUE
 # ==========================================
 
 async def update_leaderboard_message(guild):
-    """Fonction qui met à jour le message d'affichage du classement"""
+    """Met à jour le message d'affichage du classement dans le salon dédié"""
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
 
@@ -184,27 +186,27 @@ async def update_leaderboard_message(guild):
     if not channel:
         return
 
-    # Construction du texte du classement
+    # Construction du tableau de score
     embed = discord.Embed(
         title="🏆 TCO DRIFT — OFFICIAL LEADERBOARD",
-        description="Top drift scores verified by Staff & Owners.",
+        description="Official driver standings updated by Server Owner.",
         color=discord.Color.gold(),
         timestamp=datetime.datetime.now(datetime.timezone.utc)
     )
 
     if not top_scores:
-        embed.add_field(name="Standings", value="No scores registered yet.", inline=False)
+        embed.add_field(name="Standings", value="No wins registered yet.", inline=False)
     else:
         lb_text = ""
         medals = ["🥇", "🥈", "🥉"]
         for idx, (username, score) in enumerate(top_scores, start=1):
             prefix = medals[idx-1] if idx <= 3 else f"`#{idx}`"
-            lb_text += f"{prefix} **{username}** — `{score:,}` pts\n"
+            lb_text += f"{prefix} **{username}** — `{score:,}` Wins\n"
         embed.add_field(name="Top Drivers", value=lb_text, inline=False)
 
     embed.set_footer(text="Auto-updated by TCO Drift Bot")
 
-    # Mettre à jour le message ou en créer un nouveau s'il n'existe pas
+    # Mettre à jour le message s'il existe déjà
     if message_id:
         try:
             msg = await channel.fetch_message(message_id)
@@ -213,7 +215,7 @@ async def update_leaderboard_message(guild):
         except discord.NotFound:
             pass
 
-    # Si pas de message existant, en envoyer un nouveau et enregistrer son ID
+    # Si pas de message existant, en créer un nouveau
     new_msg = await channel.send(embed=embed)
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
@@ -223,26 +225,28 @@ async def update_leaderboard_message(guild):
 
 
 # ==========================================
-# 3. COMMANDES ET ÉVÉNEMENTS BOT
+# 3. COMMANDES SLASH (ALL IN SLASH)
 # ==========================================
 
 @bot.event
 async def on_ready():
-    # Enregistrer les vues persistantes pour les boutons/dropdowns
     bot.add_view(TicketDropdownView())
     bot.add_view(TicketControlView())
     try:
         synced = await bot.tree.sync()
-        print(f"OK ! {len(synced)} commande(s) synchronisée(s) globalement.")
+        print(f"OK ! {len(synced)} commande(s) Slash synchronisée(s) globalement.")
     except Exception as e:
         print(f"Erreur de synchro : {e}")
     print(f"Connecté en tant que : {bot.user}")
 
-# Commandes slash ou préfixe pour configurer
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_ticket(ctx):
-    """Envoie le panneau de ticket dans le salon courant"""
+
+# --- 1. /setup_ticket (OWNER ONLY) ---
+@bot.tree.command(name="setup_ticket", description="Afficher le panneau de ticket (Owner uniquement).")
+async def setup_ticket(interaction: discord.Interaction):
+    if interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("❌ Only the server Owner can use this command.", ephemeral=True)
+        return
+
     embed = discord.Embed(
         title="🏎️ TCO DRIFT — SUPPORT & TICKETS",
         description=(
@@ -255,29 +259,67 @@ async def setup_ticket(ctx):
         ),
         color=discord.Color.red()
     )
-    await ctx.send(embed=embed, view=TicketDropdownView())
-    await ctx.message.delete()
+    await interaction.channel.send(embed=embed, view=TicketDropdownView())
+    await interaction.response.send_message("✅ Ticket panel posted successfully!", ephemeral=True)
 
-@bot.tree.command(name="add_score", description="Ajouter ou modifier le score d'un pilote (Staff uniquement).")
-async def add_score(interaction: discord.Interaction, member: discord.Member, score: int):
-    # Restriction Staff / Admin
-    if not (interaction.user.guild_permissions.manage_messages or interaction.user.guild_permissions.administrator):
-        await interaction.response.send_message("❌ Only moderators can manage scores.", ephemeral=True)
+
+# --- 2. /setup_leaderboard (OWNER ONLY) ---
+@bot.tree.command(name="setup_leaderboard", description="Initialiser le message du leaderboard (Owner uniquement).")
+async def setup_leaderboard(interaction: discord.Interaction):
+    if interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("❌ Only the server Owner can use this command.", ephemeral=True)
+        return
+
+    await interaction.response.send_message("⏳ Setting up leaderboard...", ephemeral=True)
+    await update_leaderboard_message(interaction.guild)
+
+
+# --- 3. /add_win (OWNER ONLY) ---
+@bot.tree.command(name="add_win", description="Ajouter des victoires/points à un joueur (Owner uniquement).")
+async def add_win(interaction: discord.Interaction, member: discord.Member, amount: int = 1):
+    if interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("❌ Only the server Owner can manage wins.", ephemeral=True)
         return
 
     conn = sqlite3.connect("database.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO leaderboard (user_id, username, score) VALUES (?, ?, ?)", 
-                   (member.id, member.display_name, score))
+    cursor.execute("SELECT score FROM leaderboard WHERE user_id = ?", (member.id,))
+    row = cursor.fetchone()
+    current_score = row[0] if row else 0
+    new_score = current_score + amount
+
+    cursor.execute("INSERT OR REPLACE INTO leaderboard (user_id, username, score) VALUES (?, ?, ?)",
+                   (member.id, member.display_name, new_score))
     conn.commit()
     conn.close()
 
-    await interaction.response.send_message(f"✅ Score updated: **{member.display_name}** — `{score:,}` pts", ephemeral=True)
-    # Mettre à jour le classement en direct
+    await interaction.response.send_message(f"✅ Added `{amount}` win(s) to **{member.display_name}**. Total: `{new_score}`", ephemeral=True)
     await update_leaderboard_message(interaction.guild)
 
+
+# --- 4. /remove_win (OWNER ONLY) ---
+@bot.tree.command(name="remove_win", description="Retirer des victoires/points à un joueur (Owner uniquement).")
+async def remove_win(interaction: discord.Interaction, member: discord.Member, amount: int = 1):
+    if interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("❌ Only the server Owner can manage wins.", ephemeral=True)
+        return
+
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT score FROM leaderboard WHERE user_id = ?", (member.id,))
+    row = cursor.fetchone()
+    current_score = row[0] if row else 0
+    new_score = max(0, current_score - amount)  # Empêche d'avoir un score négatif
+
+    cursor.execute("INSERT OR REPLACE INTO leaderboard (user_id, username, score) VALUES (?, ?, ?)",
+                   (member.id, member.display_name, new_score))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"✅ Removed `{amount}` win(s) from **{member.display_name}**. Total: `{new_score}`", ephemeral=True)
+    await update_leaderboard_message(interaction.guild)
+
+
 # LANCEMENT DU BOT
-import os
-from dotenv import load_dotenv
 load_dotenv()
 bot.run(os.getenv("DISCORD_TOKEN"))
