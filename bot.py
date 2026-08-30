@@ -12,26 +12,31 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- IDENTIFIANTS DU SERVEUR ---
+# --- IDENTIFIANTS DU SERVEUR & SALONS ---
 LEADERBOARD_CHANNEL_ID = 1543274008311763044
 TICKET_CHANNEL_ID = 1543274172321370303
 TICKET_CATEGORY_ID = 1543383561103474839
 LOGS_CATEGORY_ID = 1543383625456812102
+ANNOUNCEMENT_CHANNEL_ID = 1543273382659887175  # Announcement
+COMMAND_LOGS_CHANNEL_ID = 1543274576803405965  # Staff > Logs
 
-# Salons pour les annonces de rôles et les logs système
-ANNOUNCEMENT_CHANNEL_ID = 1543273800000000000  # ⚠️ Remplace par l'ID de ton salon Annonces
-COMMAND_LOGS_CHANNEL_ID = 1543273900000000000  # ⚠️ Remplace par l'ID de ton salon Logs
+# 🏆 CONFIGURATION DES 5 RÔLES DRIFT AVEC LEURS ID DIRECTS
+ROLE_IDS = {
+    "ROOKIE": 1543330837804744704,
+    "STREET": 1543331085163958302,
+    "PRO": 1543331190038204567,
+    "TRACKER": 1543331274704560210,  # Track
+    "KING": 1543331441952301108
+}
 
-# 🏆 LES 5 RÔLES DRIFT & PALIERS DE VICTOIRES (PALIERS PERSONNALISABLES)
-RANK_THRESHOLDS = [
-    (50, "King"),
-    (30, "Tracker"),
-    (15, "Pro"),
-    (5, "Street"),
-    (0, "Rookie")
+# Paliers de victoires associés aux ID
+RANK_THRESHOLDS_BY_ID = [
+    (50, "KING"),
+    (30, "TRACKER"),
+    (15, "PRO"),
+    (5, "STREET"),
+    (0, "ROOKIE")
 ]
-
-ALL_DRIVER_ROLES = ["King", "Tracker", "Pro", "Street", "Rookie"]
 
 user_cooldowns = {}
 
@@ -59,39 +64,42 @@ init_db()
 
 
 # ==========================================
-# ⚙️ GESTION AUTOMATIQUE DES RÔLES ET RANGS
+# ⚙️ GESTION AUTOMATIQUE DES RÔLES PAR ID
 # ==========================================
 
 async def check_and_update_driver_role(guild: discord.Guild, member: discord.Member, new_score: int):
-    """Détermine le rôle correspondant au score et l'attribue au membre sur Discord."""
-    target_role_name = "Rookie"
-    for threshold, role_name in RANK_THRESHOLDS:
+    """Détermine le rôle par son ID et l'attribue au membre."""
+    target_key = "ROOKIE"
+    for threshold, key in RANK_THRESHOLDS_BY_ID:
         if new_score >= threshold:
-            target_role_name = role_name
+            target_key = key
             break
 
-    target_role = discord.utils.get(guild.roles, name=target_role_name)
+    target_role_id = ROLE_IDS.get(target_key)
+    target_role = guild.get_role(target_role_id)
+
     if not target_role:
-        print(f"⚠️ Le rôle '{target_role_name}' n'a pas été trouvé sur le serveur.")
+        print(f"⚠️ Rôle avec l'ID {target_role_id} introuvable sur le serveur.")
         return
 
-    # Vérifie si le membre a déjà exactement ce rôle
+    # Si le joueur a déjà ce rôle, on ne fait rien
     if target_role in member.roles:
         return
 
-    # Supprime tous les anciens rôles de pilote
-    roles_to_remove = [r for r in member.roles if r.name in ALL_DRIVER_ROLES and r.name != target_role_name]
+    # Retirer les autres rôles de pilote
+    all_driver_role_ids = list(ROLE_IDS.values())
+    roles_to_remove = [r for r in member.roles if r.id in all_driver_role_ids and r.id != target_role_id]
+
     if roles_to_remove:
         try:
             await member.remove_roles(*roles_to_remove)
         except Exception as e:
             print(f"Erreur lors du retrait des anciens rôles : {e}")
 
-    # Ajoute le nouveau rôle
+    # Attribuer le nouveau rôle et envoyer l'annonce
     try:
         await member.add_roles(target_role)
-        
-        # Envoi de l'annonce dans le salon Annonces
+
         announcement_channel = guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
         if announcement_channel:
             embed = discord.Embed(
@@ -104,7 +112,7 @@ async def check_and_update_driver_role(guild: discord.Guild, member: discord.Mem
             embed.set_footer(text="TCO Drift Driver Progression")
             await announcement_channel.send(embed=embed)
     except Exception as e:
-        print(f"Erreur lors de l'ajout du rôle {target_role_name} : {e}")
+        print(f"Erreur lors de l'ajout du rôle {target_role.name} : {e}")
 
 
 # ==========================================
@@ -113,7 +121,6 @@ async def check_and_update_driver_role(guild: discord.Guild, member: discord.Mem
 
 @bot.event
 async def on_app_command_completion(interaction: discord.Interaction, command: discord.app_commands.Command):
-    """Enregistre un log complet à chaque fois qu'une commande Slash est exécutée avec succès."""
     log_channel = interaction.guild.get_channel(COMMAND_LOGS_CHANNEL_ID)
     if log_channel:
         embed = discord.Embed(
@@ -127,7 +134,7 @@ async def on_app_command_completion(interaction: discord.Interaction, command: d
         if interaction.data.get("options"):
             opts = [f"`{opt['name']}`: {opt['value']}" for opt in interaction.data["options"]]
             embed.add_field(name="Arguments", value="\n".join(opts), inline=False)
-            
+
         await log_channel.send(embed=embed)
 
 
@@ -148,7 +155,7 @@ class TicketControlView(discord.ui.View):
         logs_category = interaction.guild.get_channel(LOGS_CATEGORY_ID)
         if logs_category:
             await interaction.channel.edit(category=logs_category, sync_permissions=False)
-            
+
             for target, overwrite in interaction.channel.overwrites.items():
                 if isinstance(target, discord.Member) and not target.guild_permissions.manage_channels:
                     await interaction.channel.set_permissions(target, overwrite=None)
@@ -374,8 +381,7 @@ async def add_win(interaction: discord.Interaction, member: discord.Member, amou
     conn.close()
 
     await interaction.response.send_message(f"✅ Added `{amount}` win(s) to **{member.display_name}**. Total: `{new_score}`", ephemeral=True)
-    
-    # 🏎️ MISE A JOUR DU ROLE ET DU LEADERBOARD
+
     await check_and_update_driver_role(interaction.guild, member, new_score)
     await update_leaderboard_message(interaction.guild)
 
@@ -399,8 +405,7 @@ async def remove_win(interaction: discord.Interaction, member: discord.Member, a
     conn.close()
 
     await interaction.response.send_message(f"✅ Removed `{amount}` win(s) from **{member.display_name}**. Total: `{new_score}`", ephemeral=True)
-    
-    # 🏎️ MISE A JOUR DU ROLE ET DU LEADERBOARD
+
     await check_and_update_driver_role(interaction.guild, member, new_score)
     await update_leaderboard_message(interaction.guild)
 
