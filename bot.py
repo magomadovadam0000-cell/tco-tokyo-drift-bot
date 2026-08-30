@@ -19,6 +19,13 @@ TICKET_CATEGORY_ID = 1543383561103474839
 LOGS_CATEGORY_ID = 1543383625456812102
 ANNOUNCEMENT_CHANNEL_ID = 1543273382659887175  # Announcement
 COMMAND_LOGS_CHANNEL_ID = 1543274576803405965  # Staff > Logs
+CAR_SHOWCASE_CHANNEL_ID = 1543273834701000815  # Car showcase
+
+# Rôle requis pour soumettre une voiture au Car of the Week
+RACER_ROLE_ID = 1543487798361727106
+
+# 🔥 Emoji utilisé pour voter Car of the Week
+VOTE_EMOJI = "🔥"
 
 # 🏆 CONFIGURATION DES 5 RÔLES DRIFT AVEC LEURS ID DIRECTS
 ROLE_IDS = {
@@ -55,6 +62,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value INTEGER
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS car_submissions (
+            message_id INTEGER PRIMARY KEY,
+            channel_id INTEGER,
+            user_id INTEGER,
+            car_name TEXT,
+            submitted_at TEXT
         )
     """)
     conn.commit()
@@ -412,6 +428,180 @@ async def remove_win(interaction: discord.Interaction, member: discord.Member, a
 
     await check_and_update_driver_role(interaction.guild, member, new_score)
     await update_leaderboard_message(interaction.guild)
+
+
+# ==========================================
+# 5. CAR OF THE WEEK (soumission + clôture sécurisée)
+# ==========================================
+
+@bot.tree.command(name="submit_car", description="Soumets ta voiture pour le Car of the Week.")
+async def submit_car(interaction: discord.Interaction, car_name: str, photo: discord.Attachment):
+    # Doit être utilisée uniquement dans le salon Car Showcase
+    if interaction.channel_id != CAR_SHOWCASE_CHANNEL_ID:
+        showcase_channel = interaction.guild.get_channel(CAR_SHOWCASE_CHANNEL_ID)
+        mention = showcase_channel.mention if showcase_channel else "#car-showcase"
+        await interaction.response.send_message(f"❌ Cette commande n'est utilisable que dans {mention}.", ephemeral=True)
+        return
+
+    # Doit avoir le rôle Racer
+    racer_role = interaction.guild.get_role(RACER_ROLE_ID)
+    if racer_role is None or racer_role not in interaction.user.roles:
+        await interaction.response.send_message("❌ Tu dois avoir le rôle Racer pour soumettre une voiture.", ephemeral=True)
+        return
+
+    if not photo.content_type or not photo.content_type.startswith("image/"):
+        await interaction.response.send_message("❌ Le fichier envoyé doit être une image.", ephemeral=True)
+        return
+
+    showcase_channel = interaction.guild.get_channel(CAR_SHOWCASE_CHANNEL_ID)
+    if not showcase_channel:
+        await interaction.response.send_message("❌ Salon Car Showcase introuvable.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🚗 {car_name}",
+        description=f"Soumis par {interaction.user.mention}\n\nVote avec {VOTE_EMOJI} !",
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.set_image(url=photo.url)
+    embed.set_footer(text="Car of the Week — soumission officielle")
+
+    submission_msg = await showcase_channel.send(embed=embed)
+    await submission_msg.add_reaction(VOTE_EMOJI)
+
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO car_submissions (message_id, channel_id, user_id, car_name, submitted_at) VALUES (?, ?, ?, ?, ?)",
+        (submission_msg.id, showcase_channel.id, interaction.user.id, car_name, datetime.datetime.now(datetime.timezone.utc).isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"✅ Ta voiture a été soumise dans {showcase_channel.mention} !", ephemeral=True)
+
+
+@bot.tree.command(name="car_of_week", description="Clôture les votes et annonce le Car of the Week (Owner uniquement).")
+async def car_of_week(interaction: discord.Interaction):
+    if interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("❌ Only the server Owner can close Car of the Week voting.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT message_id, channel_id, user_id, car_name FROM car_submissions")
+    submissions = cursor.fetchall()
+    conn.close()
+
+    if not submissions:
+        await interaction.followup.send("❌ Aucune soumission enregistrée cette semaine.", ephemeral=True)
+        return
+
+    best = None  # (votes, message_id, user_id, car_name, message_obj)
+
+    for message_id, channel_id, user_id, car_name in submissions:
+        channel = interaction.guild.get_channel(channel_id)
+        if not channel:
+            continue
+        try:
+            msg = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            continue
+
+        votes = 0
+        for reaction in msg.reactions:
+            if str(reaction.emoji) == VOTE_EMOJI:
+                # On retire le vote automatique du bot lui-même
+                votes = reaction.count - 1 if reaction.me else reaction.count
+                break
+
+        if best is None or votes > best[0]:
+            best = (votes, message_id, user_id, car_name, msg)
+
+    # On vide les soumissions pour repartir sur une semaine propre
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM car_submissions")
+    conn.commit()
+    conn.close()
+
+    if best is None:
+        await interaction.followup.send("❌ Impossible de retrouver les messages de soumission (supprimés ?).", ephemeral=True)
+        return
+
+    votes, message_id, user_id, car_name, msg = best
+    winner_member = interaction.guild.get_member(user_id)
+
+    announcement_channel = interaction.guild.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+    if announcement_channel:
+        embed = discord.Embed(
+            title="🏆 CAR OF THE WEEK",
+            description=f"Félicitations {winner_member.mention if winner_member else car_name} ! 🎉\n\n"
+                        f"**{car_name}** remporte le Car of the Week avec **{votes}** {VOTE_EMOJI} !",
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.now(datetime.timezone.utc)
+        )
+        if msg.embeds and msg.embeds[0].image:
+            embed.set_image(url=msg.embeds[0].image.url)
+        embed.set_footer(text="TCO Drift — Car of the Week")
+        await announcement_channel.send(embed=embed)
+
+    await interaction.followup.send(f"✅ Car of the Week annoncé : **{car_name}** ({votes} votes). Compteurs remis à zéro.", ephemeral=True)
+
+
+# ==========================================
+# 6. STATISTIQUES PERSONNELLES
+# ==========================================
+
+@bot.tree.command(name="mystats", description="Affiche tes statistiques de pilote.")
+async def mystats(interaction: discord.Interaction):
+    conn = sqlite3.connect("database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT score FROM leaderboard WHERE user_id = ?", (interaction.user.id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    score = row[0] if row else 0
+
+    current_rank = "ROOKIE"
+    for threshold, key in RANK_THRESHOLDS_BY_ID:
+        if score >= threshold:
+            current_rank = key
+            break
+
+    # Cherche le prochain palier au-dessus du score actuel
+    next_rank = None
+    next_threshold = None
+    sorted_thresholds = sorted(RANK_THRESHOLDS_BY_ID, key=lambda x: x[0])
+    for threshold, key in sorted_thresholds:
+        if threshold > score:
+            next_rank = key
+            next_threshold = threshold
+            break
+
+    embed = discord.Embed(
+        title=f"📊 Statistiques de {interaction.user.display_name}",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.now(datetime.timezone.utc)
+    )
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.add_field(name="Victoires", value=f"`{score}`", inline=True)
+    embed.add_field(name="Rang actuel", value=f"**{current_rank}**", inline=True)
+
+    if next_rank:
+        remaining = next_threshold - score
+        embed.add_field(
+            name="Prochain rang",
+            value=f"**{next_rank}** dans `{remaining}` victoire(s)",
+            inline=False
+        )
+    else:
+        embed.add_field(name="Prochain rang", value="🏆 Rang maximum atteint !", inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # LANCEMENT DU BOT
