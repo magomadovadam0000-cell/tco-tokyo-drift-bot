@@ -21,6 +21,9 @@ ANNOUNCEMENT_CHANNEL_ID = 1543273382659887175  # Announcement
 COMMAND_LOGS_CHANNEL_ID = 1543274576803405965  # Staff > Logs
 CAR_SHOWCASE_CHANNEL_ID = 1543273834701000815  # Car showcase
 
+# ID de ton serveur, pour synchroniser les commandes slash instantanément dessus
+GUILD_ID = 1543268829906337812
+
 # Rôle requis pour soumettre une voiture au Car of the Week
 RACER_ROLE_ID = 1543487798361727106
 
@@ -343,8 +346,15 @@ async def on_ready():
     bot.add_view(TicketDropdownView())
     bot.add_view(TicketControlView())
     try:
-        synced = await bot.tree.sync()
-        print(f"OK ! {len(synced)} commande(s) Slash synchronisée(s) globalement.")
+        # Synchro GLOBALE (peut prendre jusqu'à 1h pour apparaître partout)
+        synced_global = await bot.tree.sync()
+        print(f"OK ! {len(synced_global)} commande(s) Slash synchronisée(s) globalement.")
+
+        # Synchro INSTANTANÉE sur ton serveur (visible en quelques secondes)
+        guild_obj = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild_obj)
+        synced_guild = await bot.tree.sync(guild=guild_obj)
+        print(f"OK ! {len(synced_guild)} commande(s) Slash synchronisée(s) instantanément sur le serveur.")
     except Exception as e:
         print(f"Erreur de synchro : {e}")
     print(f"Connecté en tant que : {bot.user}")
