@@ -206,6 +206,10 @@ class TicketDropdown(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        # On acquitte l'interaction TOUT DE SUITE (avant les opérations lentes)
+        # pour éviter "Unknown interaction" (timeout) et "already acknowledged" (double réponse).
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         user = interaction.user
         guild = interaction.guild
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -214,14 +218,14 @@ class TicketDropdown(discord.ui.Select):
             elapsed = (now - user_cooldowns[user.id]).total_seconds()
             if elapsed < 60:
                 remaining = int(60 - elapsed)
-                await interaction.response.send_message(f"⏳ Please wait {remaining} seconds before opening another ticket.", ephemeral=True)
+                await interaction.followup.send(f"⏳ Please wait {remaining} seconds before opening another ticket.", ephemeral=True)
                 return
 
         ticket_category = guild.get_channel(TICKET_CATEGORY_ID)
         if ticket_category:
             for channel in ticket_category.text_channels:
                 if channel.name.endswith(f"-{user.id}") or channel.name.startswith(f"{self.values[0]}-{user.name.lower()}"):
-                    await interaction.response.send_message("❌ You already have an active ticket open!", ephemeral=True)
+                    await interaction.followup.send("❌ You already have an active ticket open!", ephemeral=True)
                     return
 
         user_cooldowns[user.id] = now
@@ -241,7 +245,7 @@ class TicketDropdown(discord.ui.Select):
             reason=f"Ticket opened by {user}"
         )
 
-        await interaction.response.send_message(f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True)
+        await interaction.followup.send(f"✅ Your ticket has been created: {ticket_channel.mention}", ephemeral=True)
 
         embed = discord.Embed(
             title=f"Ticket: {selected_option.upper()} — {user.display_name}",
